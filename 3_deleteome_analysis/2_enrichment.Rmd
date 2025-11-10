@@ -1,0 +1,252 @@
+---
+title: "2D annotation enrichment"
+author: "MH"
+date: "2024-07-08"
+output: html_document
+---
+```{r setup}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+rm(list=ls())
+load('../../r_functions/functions.rda')
+# Install packages if not already installed
+load_pkg("BiocManager")
+load_pkg("mitch")
+load_pkg("pkgload")
+load_pkg("pheatmap")
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(gplots)
+library(purrr)
+library(patchwork)
+library(RColorBrewer)
+library(stringr)
+```
+
+Process input tables and perform enrichment analysis using mitch
+```{r}
+# Import gene ontology annotations
+sgd_go <- read_tsv("../input_tables/SGD_GO_annotations.tsv", show_col_types = FALSE) %>% select("GO_name" = Gene.goAnnotation.ontologyTerm.name,"GO_id" = Gene.goAnnotation.ontologyTerm.identifier, "gene_id" = Gene.secondaryIdentifier)
+
+# Transform annotation table into GMT format and convert to named list of character vectors
+sgd_go_wide <- sgd_go %>% group_by(GO_name, GO_id) %>% mutate(rn = row_number()) %>% pivot_wider(names_from = rn, values_from = gene_id) %>% filter(!is.na(GO_name))
+
+gene_list <- apply(sgd_go_wide, 1, function(row) {
+  go_name <- row[["GO_name"]]
+  gene_ids <- row[-1]
+  gene_ids <- gene_ids[!is.na(gene_ids)]  # Remove NA values
+  return(setNames(list(as.character(gene_ids)), go_name))
+})
+gene_list <- unlist(gene_list, recursive = FALSE)
+
+# Custom function to read and process deleteome correlation tables into mitch format
+corr_to_mitch <- function(file) {
+  read_tsv(file, show_col_types = FALSE) %>%
+    #shorten column names
+    select(gene_id, 
+           elutriation_haploid = `elutriation-arrest_RNA_MS64_pooled`, 
+           elutriation_diploid = `elutriation-arrest_RNA_MS67_pooled`, 
+           G1_arrest = `SCD-G1-arrest_RNA_pooled`, 
+           size_mutants = `size-mutants_RNA_pooled`) %>%
+    filter(!is.na(gene_id)) %>%
+    #rank correlations by descending average absolute values
+    rowwise() %>%
+    mutate(mean_abs_corr = mean(abs(c_across(where(is.numeric))))) %>% 
+    ungroup() %>%
+    mutate(rank = rank(-mean_abs_corr)) %>%
+    arrange(rank) %>% 
+    select(-mean_abs_corr, -rank) %>% 
+    #make gene id as row names
+    tibble::column_to_rownames(var = "gene_id")
+}
+
+# Base file suffixes
+input_base_names <- c("", "_svd-rm", "_growth-rm", "_svd-size-rm", "_growth-size-rm")
+
+# Base file paths
+input_base_path <- "../output_tables/deleteome_correlation"
+output_base_path <- "../output_tables/deleteome_enrichment_result"
+report_base_path <- "../output_tables/deleteome_enrichment_report"
+plot_base_path <- "../figures/deleteome_enrichment_charts"
+
+# Construct full input file paths
+input_files <- paste0(input_base_path, input_base_names, ".txt")
+
+# Process files to perform enrichment calculation
+correlations <- input_files %>%
+  map(~ corr_to_mitch(.x)) %>%
+  set_names(paste0("corr_del", input_base_names))
+
+# Calculate enrichment results for all correlations
+enrichment_results_list <- map(correlations, ~ mitch_calc(.x, gene_list))
+
+# Generate outputs, reports, and plots for each dataset
+#generate mitch reports and plots might take a long time (5~10 mins per report/plot), generate only enrichment_results takes much shorter
+walk2(enrichment_results_list, input_base_names, function(enrichment_results, suffix) {
+  # Extract enrichment scores
+  write_tsv(enrichment_results$enrichment_result, paste0(output_base_path, suffix, ".txt"))
+  
+  # Generate report
+  #mitch_report(enrichment_results, paste0(report_base_path, suffix, ".html"), overwrite = TRUE)
+  
+  # Generate plots
+  #mitch_plots(enrichment_results, outfile = paste0(plot_base_path, suffix, ".pdf"))
+})
+
+# Function to join datasets with specified suffixes
+full_join_enrichment <- function(enrichment_results_list, suffixes_list) {
+  # Check if the length of suffixes matches the number of datasets
+  if (length(suffixes_list) != length(enrichment_results_list)) {
+    stop("The length of suffixes_list must match the number of datasets in enrichment_results_list")
+  }
+  # Start with the first dataset as the initial dataframe
+  combined_data <- enrichment_results_list[[1]]$enrichment_result %>% filter(p.adjustMANOVA < 0.05) %>% select(set, s.elutriation_ha, s.elutriation_di, s.G1_arrest, s.size_mutants, p.adjustMANOVA)
+  # Iterate over the remaining datasets and apply full_join with specified suffixes
+  for (i in 2:length(enrichment_results_list)) {
+    suffix <- suffixes_list[i]
+    combined_data <- full_join(
+      combined_data, 
+      enrichment_results_list[[i]]$enrichment_result %>% filter(p.adjustMANOVA < 0.05) %>% select(set, s.elutriation_ha, s.elutriation_di, s.G1_arrest, s.size_mutants, p.adjustMANOVA), 
+      by = "set", 
+      suffix = c("", suffix)
+    )
+  }
+  return(combined_data)
+}
+
+# Create enrichment score table including results from all five datasets
+combined_result <- full_join_enrichment(enrichment_results_list, input_base_names)
+combined_result %>% write_tsv("../output_tables/deleteome_enrichment_result_combined.txt")
+```
+
+Differential expression analysis
+```{r}
+# Filter for rows with NA to assess differential expression
+original_svd_rm <- combined_result %>% filter(!if_any(2:5, is.na)) %>% filter(if_any(ends_with("svd-rm"), is.na)) %>% arrange(`p.adjustMANOVA_svd-rm`) %>% pull(1) %>% data.frame(set = .)
+
+original_growth_rm <- combined_result %>% filter(!if_any(2:5, is.na)) %>% filter(if_any(ends_with("growth-rm"), is.na)) %>% arrange(`p.adjustMANOVA_growth-rm`) %>% pull(1) %>% data.frame(set = .)
+
+svd_rm_svd_size_rm <- combined_result %>% filter(!if_any(ends_with("svd-rm"), is.na)) %>% filter(if_any(ends_with("svd-size-rm"), is.na)) %>% arrange(`p.adjustMANOVA_svd-size-rm`) %>% pull(1) %>% data.frame(set = .)
+
+growth_rm_growth_size_rm <- combined_result %>% filter(!if_any(ends_with("growth-rm"), is.na)) %>% filter(if_any(ends_with("growth-size-rm"), is.na)) %>% arrange(`p.adjustMANOVA_growth-size-rm`) %>% pull(1) %>% data.frame(set = .)
+
+svd_size_rm <- combined_result %>% filter(!if_any(ends_with("svd-size-rm"), is.na)) %>% arrange(`p.adjustMANOVA_svd-size-rm`) %>% pull(1) %>% data.frame(set = .)
+
+growth_size_rm <- combined_result %>% filter(!if_any(ends_with("growth-size-rm"), is.na)) %>% arrange(`p.adjustMANOVA_growth-size-rm`) %>% pull(1) %>% data.frame(set = .)
+
+original_svd_growth_rm <- original_svd_rm %>% full_join(original_growth_rm, by = "set") %>% mutate(`Enriched in original but not SVD/Growth removal` = set, id = row_number()) %>% select(-set)
+
+svd_growth_rm_svd_growth_size_rm <- svd_rm_svd_size_rm %>% full_join(growth_rm_growth_size_rm, by = "set") %>% mutate(`Enriched in SVD/Growth removal but not SVD/Growth & Size removal` = set, id = row_number()) %>% select(-set)
+
+svd_growth_rm <- svd_size_rm %>% full_join(growth_size_rm, by = "set") %>% mutate(`Enriched in SVD/Growth & Size removal` = set, id = row_number()) %>% select(-set)
+
+filtered_gene_sets <- original_svd_growth_rm %>% full_join(svd_growth_rm_svd_growth_size_rm) %>% full_join(svd_growth_rm) %>% select(-id)
+filtered_gene_sets %>% write_tsv("../output_tables/filtered_gene_sets.txt")
+```
+
+Enrichment score heatmaps
+```{r}
+# Function to generate heatmap of enrichment scores
+heatmaps <- function(res, out_plot) {
+    d <- ncol(res$ranked_profile)
+    resrows = 40
+    hmapx <- head(res$enrichment_result[, 4:(4 + d - 1)], resrows)
+    rownames(hmapx) <- head(res$enrichment_result$set, resrows)
+    colnames(hmapx) <- gsub("^s.", "", colnames(hmapx))
+    avg_enrichment_scores <- rowMeans(hmapx, na.rm = TRUE)
+    hmapx <- hmapx[order(avg_enrichment_scores, decreasing = TRUE), ]
+    my_palette <- colorRampPalette(c("blue", "white", "red"))(n = 25)
+    svg(out_plot, width = 11, height = 8)
+    pheatmap(as.matrix(hmapx), color = my_palette,
+             border_color = NA,
+             cellwidth = 25,
+             angle_col = 45,
+             annotation_legend = TRUE,
+             legend = TRUE,
+             breaks = seq(-1, 1, length.out = length(my_palette) + 1),
+             legend_breaks = seq(-1, 1, length.out = 9),  
+             legend_labels = round(seq(-1, 1, length.out = 9), 2),
+             cluster_rows = FALSE,
+             cluster_cols = FALSE)
+    dev.off()
+}
+
+# Generate and save heatmaps for all enrichment results
+walk2(enrichment_results_list, input_base_names, function(enrichment_results, suffix) {
+  output_plot <- paste0("../figures/deleteome_heatmap", suffix, ".svg")
+  heatmaps(enrichment_results, output_plot)
+})
+```
+
+Annotated enrichment plots
+```{r}
+# Function to create enrichment plots
+enrichment_plot <- function(data, x_var, y_var, x_label, y_label) {
+  # Calculate the combined score for each set
+  data <- data %>% mutate(combined_score = (!!sym(x_var) + !!sym(y_var)) / 2)
+  # Get the top 5 and bottom 5 sets based on the combined score
+  top_sets <- data %>% slice_max(combined_score, n = 5) %>% arrange(combined_score)
+  bottom_sets <- data %>% slice_min(combined_score, n = 5) %>% arrange(desc(combined_score))
+  # Combine top and bottom sets for labeling
+  label_data <- bind_rows(top_sets, bottom_sets) %>% mutate(set = str_wrap(set, width = 35))
+
+  # Generate color palettes for the labels
+  warm_colors <- brewer.pal(n = nrow(top_sets), name = "Reds")
+  cold_colors <- brewer.pal(n = nrow(bottom_sets), name = "Blues")
+  label_colors <- c(warm_colors, cold_colors)
+  label_colors <- setNames(label_colors, label_data$set)
+  
+  ggplot(data, aes_string(x = x_var, y = y_var, size = "setSize")) +
+    geom_point(alpha = 0.3, color = "gray") +  # Non-labeled points
+    geom_point(data = label_data, aes_string(color = "set"), alpha = 0.7, size = 5) +  # Labeled points with colors
+    scale_color_manual(values = label_colors) + 
+    scale_size(range = c(3, 10)) +
+    guides(color = guide_legend(title = "Gene sets", ncol = 1, order = 1)) +  # Custom legend for labels
+    theme_minimal() +
+    labs(
+      x = x_label,
+      y = y_label,
+      size = "Number of genes \nper annotation group"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      legend.position = "right",
+      legend.title = element_text(size = 10),
+      legend.text = element_text(size = 10)
+    ) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", alpha = 0.2) +
+    xlim(-1, 1) +
+    ylim(-1, 1)
+}
+
+# List of input files
+enrichment_scores <- paste0(output_base_path, input_base_names, ".txt")
+
+# Variable pairs for plots
+plot_vars <- list(
+  list(x_var = "s.elutriation_ha", y_var = "s.G1_arrest", x_label = "Enrichment Score - Elutriation arrest haploid", y_label = "Enrichment Score - G1 arrest"),
+  list(x_var = "s.elutriation_ha", y_var = "s.size_mutants", x_label = "Enrichment Score - Elutriation arrest haploid", y_label = "Enrichment Score - Size mutants"),
+  list(x_var = "s.size_mutants", y_var = "s.G1_arrest", x_label = "Enrichment Score - Size mutants", y_label = "Enrichment Score - G1 arrest"),
+  list(x_var = "s.elutriation_ha", y_var = "s.elutriation_di", x_label = "Enrichment Score - Elutriation arrest haploid", y_label = "Enrichment Score - Elutriation arrest diploid")
+)
+
+# Read and filter all datasets
+datasets <- map(enrichment_scores, ~ read_tsv(.x, show_col_types = FALSE) %>% filter(p.adjustMANOVA < 0.05))
+
+# Generate and assign names to combined plots for each dataset
+combined_plots <- list()
+for (i in seq_along(datasets)) {
+  data <- datasets[[i]]
+  suffix <- input_base_names[[i]]
+  
+  plots <- map(plot_vars, ~ enrichment_plot(data, .x$x_var, .x$y_var, .x$x_label, .x$y_label))
+  combined_plot <- wrap_plots(plots, ncol = 2)
+  
+  plot_name <- paste0("deleteome_annotated_enrichment_plot", suffix)
+  assign(plot_name, combined_plot)
+  combined_plots[[plot_name]] <- combined_plot
+  
+  print(combined_plot)
+  ggsave(paste0("../figures/", plot_name, ".svg"), plot = combined_plot, dpi = 300, width = 12, height = 10)
+}
+```

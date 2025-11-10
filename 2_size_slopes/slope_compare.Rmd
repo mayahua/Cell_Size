@@ -1,0 +1,144 @@
+---
+title: "Compare RNA and ChIP slopes"
+author: "MH"
+date: "2024-06-03"
+output: html_document
+---
+```{r setup}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path)) 
+rm(list=ls())
+library(broom)
+library(MASS)
+library(tidyverse)
+library(ggplot2)
+load('../../r_functions/functions.rda')
+```
+Process tables
+```{r}
+# Create output plots and table directories
+if (!dir.exists("../figures/")) {
+  dir.create("../figures/", recursive = TRUE)
+}
+if (!dir.exists("../output_tables/")) {
+  dir.create("../output_tables/", recursive = TRUE)
+}
+
+# Function to rename TPM/RPKM columns in RNA and ChIP tables
+rename_TPM_RPKM_col <- function(df) {
+df <- df %>% rename_with(~ str_replace(.x, "RPKMref|TPMref", "ref")) %>% 
+rename_with(~ str_replace(.x, "RPKM_rescaled_m|TPMm", "expression_m"))
+return(df)}
+
+# Import slope tables
+files <- dir(path = "../input_tables/", pattern = "*slopes.txt", full.names = TRUE)
+datasets <- files %>% map(~read_tsv(.x, show_col_types = FALSE)) %>% map(rename_TPM_RPKM_col) %>% set_names(sub(pattern = "(.*)_slopes\\..*$", replacement = "\\1", basename(files)))
+
+df_combined_slopes <- bind_rows(datasets, .id = "experiment_set") %>% unite(., sample, c(experiment_set, strain_id, replicate, antibody), sep = "_", na.rm=TRUE, remove=FALSE) %>% separate_wider_delim(experiment_set, delim = "_", names = c("exp_group", "exp_method"), cols_remove=FALSE) %>% filter(expression_min > 1 & slope_SE < 0.25)
+
+df_combined_slopes %>% write_tsv("../output_tables/slopes_combined.txt")
+
+df_decay <- read_tsv("../input_tables/half_lives_fold_change.txt", show_col_types=FALSE) %>% filter(max_SE_k<1) %>% pivot_wider(id_cols = gene_id, names_from = dataset, values_from = log2_norm_half_life_FC, names_prefix="FC_")
+```
+
+Correlation analysis (size-mutants replicates)
+```{r}
+df_corr_mutants <- df_combined_slopes %>% filter(exp_group=="size-mutants", replicate!="pooled", antibody!="input"|is.na(antibody)) %>% pivot_wider(id_cols=c("gene_id"), names_from="sample", values_from=c("slope"))
+plot_corr_size_mutants_pearson <- plot_corr(df_corr_mutants, corr_type = "pearson")
+plot_corr_size_mutants_pearson
+plot_corr_size_mutants_spearman <- plot_corr(df_corr_mutants, corr_type = "spearman")
+plot_corr_size_mutants_spearman
+```
+Correlation analysis (size-mutants pooled)
+```{r}
+#Pooled
+df_corr_mutants_pooled <- df_combined_slopes %>% filter(exp_group=="size-mutants", replicate=="pooled", antibody!="input"|is.na(antibody)) %>% pivot_wider(id_cols=c("gene_id"), names_from="sample", values_from=c("slope")) %>% left_join(., select(df_decay, gene_id, FC_size_mutant_decay), by="gene_id")
+plot_corr_size_mutants_pooled_pearson <- plot_corr(df_corr_mutants_pooled, corr_type = "pearson")
+plot_corr_size_mutants_pooled_pearson
+plot_corr_size_mutants_pooled_spearman <- plot_corr(df_corr_mutants_pooled, corr_type = "spearman")
+plot_corr_size_mutants_pooled_spearman
+```
+Correlation analysis (elutriation-arrested replicates)
+```{r}
+# Calculate correlations between RNA-seq and ChIP-seq slopes, convert to tidy format and plot
+df_corr_arrest <- df_combined_slopes %>% filter(exp_group=="elutriation-arrest", replicate!="pooled", antibody!="input"|is.na(antibody), antibody!="H3"|is.na(antibody), antibody!="H4"|is.na(antibody)) %>% pivot_wider(id_cols=c("gene_id"), names_from="sample", values_from=c("slope"))
+plot_corr_elutriation_pearson <- plot_corr(df_corr_arrest, corr_type = "pearson")
+plot_corr_elutriation_pearson
+plot_corr_elutriation_spearman <- plot_corr(df_corr_arrest, corr_type = "spearman")
+plot_corr_elutriation_spearman
+```
+Correlation analysis (pooled elutriation and G1 arrest)
+```{r}
+# Calculate correlations between RNA-seq and ChIP-seq slopes, convert to tidy format and plot
+#All
+df_corr_arrest_pooled <- df_combined_slopes %>% filter(str_detect(experiment_set, "arrest"), replicate=="pooled", antibody!="input"|is.na(antibody), antibody!="H3"|is.na(antibody), antibody!="H4"|is.na(antibody)) %>% pivot_wider(id_cols=c("gene_id"), names_from="sample", values_from=c("slope")) %>% left_join(., select(df_decay, gene_id, FC_G1_arrest_decay), by="gene_id")
+
+plot_corr_arrest_pooled_pearson <- plot_corr(df_corr_arrest_pooled, corr_type = "pearson")
+plot_corr_arrest_pooled_pearson
+plot_corr_arrest_pooled_spearman <- plot_corr(df_corr_arrest_pooled, corr_type = "spearman")
+plot_corr_arrest_pooled_spearman
+```
+
+Multivariable regression on pooled values for Elutriation arrest comparing replicates
+```{r}
+df_fit <- df_corr_arrest
+fit_rep_elutriation <- lm(df_fit$`elutriation-arrest_RNA_MS64_rep1` ~ df_fit$`elutriation-arrest_RNA_MS64_rep2`) %>% summary()
+fit_rep_elutriation$adj.r.squared
+```
+Multivariable regression on pooled values for Elutriation and G1 arrest
+```{r}
+df_fit <- df_corr_arrest_pooled
+fit_pooled_elutriation <- lm(df_fit$`elutriation-arrest_RNA_MS64_pooled` ~ df_fit$`elutriation-arrest_ChIP_MS64_pooled_Rpb1`) %>% summary()
+fit_multi_elutriation <- lm(df_fit$`elutriation-arrest_RNA_MS64_pooled` ~ df_fit$`elutriation-arrest_ChIP_MS64_pooled_Rpb1` + df_fit$FC_G1_arrest_decay) %>% summary()
+c(fit_pooled_elutriation$adj.r.squared, fit_multi_elutriation$adj.r.squared)
+```
+Multivariable regression on pooled values for size mutants comparing replicates
+```{r}
+## Simple linear regression on all columns
+
+df <- df_combined_slopes %>% filter(exp_group=="size-mutants", exp_method=="RNA", replicate!="pooled", antibody!="input"|is.na(antibody)) %>% pivot_wider(id_cols=c("gene_id"), names_from="sample", values_from=c("slope"))
+
+# Function to perform linear regression on a pair of columns
+linear_regression <- function(data, col1, col2) {
+    formula <- as.formula(paste0("`", col2, "` ~ `", col1, "`"))
+    model <- lm(formula, data = data)
+    tidied_model <- tidy(model) %>% mutate(adj.r.squared = summary(model)$adj.r.squared)
+    return(tidied_model)
+}
+
+# Generate all pairs of column names (excluding the first column 'gene_id')
+column_pairs <- combn(names(df)[-1], 2, simplify = FALSE)
+
+# Apply the regression function to each pair
+regression_results <- map(column_pairs, ~linear_regression(df, .x[1], .x[2]))
+
+# Combine results into a single data frame
+regression_summary <- bind_rows(regression_results, .id = "pair_id") %>% mutate(pair = map_chr(pair_id, ~paste(column_pairs[[as.integer(.)]], collapse = " vs "))) %>% filter(term!="(Intercept)") %>% select(8,7)
+
+regression_average <- regression_summary %>% summarise(avg_adj_r_squared = mean(adj.r.squared, na.rm = TRUE)) %>% pull(avg_adj_r_squared)
+regression_average
+```
+Multivariable regression on pooled values for size mutants
+```{r}
+df_fit <- df_corr_mutants_pooled
+fit_pooled_size_mutants <- lm(df_fit$`size-mutants_RNA_pooled` ~ df_fit$`size-mutants_ChIP_pooled_Rpb1`) %>% summary()
+fit_multi_size_mutants <- lm(df_fit$`size-mutants_RNA_pooled` ~ df_fit$`size-mutants_ChIP_pooled_Rpb1` + df_fit$`FC_size_mutant_decay`) %>% summary()
+c(fit_pooled_size_mutants$adj.r.squared, fit_multi_size_mutants$adj.r.squared)
+```
+Save regression results as a table
+```{r}
+`experiment` <- c("size_mutants", "elutriation_arrest")
+`replicate~replicate` <- c(fit_rep_elutriation$adj.r.squared, regression_average)
+`RNA~ChIP` <- c(fit_pooled_elutriation$adj.r.squared, fit_pooled_size_mutants$adj.r.squared)
+`RNA~ChIP+decay` <- c(fit_multi_elutriation$adj.r.squared, fit_multi_size_mutants$adj.r.squared)
+regression <- data.frame(`experiment`, `replicate~replicate`, `RNA~ChIP`, `RNA~ChIP+decay`) %>% mutate(`(RNA~ChIP)/(RNA~ChIP+decay)`=`RNA~ChIP`/`RNA~ChIP+decay`)
+regression %>% write_tsv("../output_tables/regression.txt")
+```
+Save plots
+```{r}
+# Call the function to save all ggplot objects
+save_all_ggplots()
+
+# Save specific plots in specific sizes
+#plot_corr_size_mutants_pooled_pearson %>% ggsave(filename = "../figures/plot_corr_size_mutants_pooled_pearson.svg", dpi = 300, width = 5, height = 4)
+#plot_corr_arrest_pooled_pearson %>% ggsave(filename = "../figures/plot_corr_arrest_pooled_pearson.svg", dpi = 300, width = 5.5, height = 5)
+```

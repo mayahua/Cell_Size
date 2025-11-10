@@ -1,0 +1,448 @@
+---
+title: "Correlation of RNA vs deleteome dataset"
+author: "MH"
+date: "2024-06-19"
+output: html_document
+---
+```{r setup}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path)) 
+rm(list=ls())
+library(broom)
+library(MASS)
+library(tidyverse)
+library(patchwork)
+load('../../r_functions/functions.rda')
+```
+Correlate deleteome data and size slopes
+
+Process tables
+```{r}
+# Create output plots and table directories
+if (!dir.exists("../figures/")) {
+  dir.create("../figures/", recursive = TRUE)
+}
+if (!dir.exists("../output_tables/")) {
+  dir.create("../output_tables/", recursive = TRUE)
+}
+
+## Load tables
+
+#slopes
+df_combined <- read_tsv("../../size_slopes/output_tables/slopes_combined.txt", show_col_types=FALSE)
+#index for matching gene name and gene id
+index <- read_tsv("../input_tables/deleteome_index.txt", show_col_types=FALSE)
+#original deleteome
+deleteome <- read_tsv("../input_tables/deleteome_all_mutants_controls.txt", show_col_types=FALSE) %>% rename("gene_id"=2, "gene_name"=3)
+#transformed deleteome, svd removed
+deleteome_svd <- read_tsv("../input_tables/deleteome_all_mutants_svd_transformed.txt", show_col_types=FALSE) %>% rename("gene_id"=1, "gene_name"=2)
+
+## Process deleteome tables to match the combined slope table
+
+# Original table (slow growth signature included)
+# Remove 'A' and 'p-values' columns, remove column numbers appended due to duplicate column names when import
+df_del <- deleteome %>% select(-1, -all_of(names(.)[(.[1, ] == "A" | .[1, ] == "p_value") & !is.na(.[1, ])])) %>% .[-1,] %>% rename_with(~ gsub("\\.\\.\\..*$", "", .) %>% gsub(" ", ".", .) %>% gsub("-", ".", .), contains("vs"))
+# Pivot longer, extract deleted genes, turn slopes into numeric, create reference name
+df_del_long <- df_del %>% pivot_longer(cols = contains("vs"), names_to = "deletion", values_to = "FC") %>% separate(deletion, into = c("gene_deleted"), sep = "\\.", remove = FALSE, extra = "drop") %>% filter(gene_deleted!="wt") %>% mutate(FC = as.numeric(FC), gene_deleted=toupper(gene_deleted))
+
+# SVD transformed table (slow growth signature removed)
+df_del_svd_long <- deleteome_svd %>% rename("mf(alpha)1.del.vs..wt"=mf.alpha.1.del.vs..wt, "mf(alpha)2.del.vs..wt"=mf.alpha.2.del.vs..wt, "arg5,6.del.vs..wt"=arg5.6.del.vs..wt, "ymr031c.del.vs..wt"=ymr031c.vs..wt) %>% pivot_longer(cols = contains("vs"), names_to = "deletion", values_to = "FC") %>% separate(deletion, into = c("gene_deleted"), sep = "\\.", remove = FALSE, extra = "drop") %>% mutate(FC = as.numeric(FC), gene_deleted=toupper(gene_deleted))
+```
+Correlation
+```{r}
+# Transform slope table for correlation
+df_corr_1 <- df_combined %>% filter(expression_min>2, exp_method=="RNA", replicate=="pooled") %>% pivot_wider(id_cols=c("gene_id"), names_from="sample", values_from=c("slope"))
+
+# Original
+df_corr <- df_del_long %>% pivot_wider(id_cols=c("gene_id"), names_from="gene_deleted", values_from=c("FC"), values_fn = ~ mean(.x, na.rm = TRUE)) %>% full_join(df_corr_1, ., by = "gene_id")
+
+rcorr_results <- df_corr %>% dplyr::select(where(is.numeric)) %>% as.matrix() %>% Hmisc::rcorr(type = "pearson")
+
+cor_matrix_r <- rcorr_results$r %>% as.data.frame() %>% rownames_to_column("var1") %>% gather(var2, correlation, -var1)
+
+corr_del <- cor_matrix_r %>% filter(str_detect(var1, "elutriation-arrest|G1-arrest|size-mutants") & !str_detect(var2, "elutriation-arrest|G1-arrest|size-mutants")) %>% pivot_wider(names_from='var1', values_from=correlation) %>% rename(gene_name='var2') %>% left_join(index, by = "gene_name") %>% select(gene_name, gene_id, everything())
+
+# SVD removed
+df_corr <- df_del_svd_long %>% pivot_wider(id_cols=c("gene_id"), names_from="gene_deleted", values_from=c("FC"), values_fn = ~ mean(.x, na.rm = TRUE)) %>% full_join(df_corr_1, ., by = "gene_id")
+
+rcorr_results <- df_corr %>% dplyr::select(where(is.numeric)) %>% as.matrix() %>% Hmisc::rcorr(type = "pearson")
+
+cor_matrix_r <- rcorr_results$r %>% as.data.frame() %>% rownames_to_column("var1") %>% gather(var2, correlation, -var1)
+
+corr_del_svd <- cor_matrix_r %>% filter(str_detect(var1, "elutriation-arrest|G1-arrest|size-mutants") & !str_detect(var2, "elutriation-arrest|G1-arrest|size-mutants")) %>% pivot_wider(names_from='var1', values_from=correlation) %>% rename(gene_name='var2') %>% left_join(index, by = "gene_name") %>% select(gene_name, gene_id, everything())
+
+# Export correlations
+corr_del %>% write_tsv("../output_tables/deleteome_correlation.txt")
+corr_del_svd %>% write_tsv("../output_tables/deleteome_correlation_svd-rm.txt")
+```
+Scatter plots (between experiments)
+```{r, warning=FALSE, error=FALSE}
+## Original
+corr_del <- read_tsv("../output_tables/deleteome_correlation.txt", show_col_types=FALSE)
+# Plot all pairs of columns
+subject <- corr_del[-c(1:2)]
+plots <- list()
+for (i in 1:(ncol(subject) - 1)) {
+  for (j in (i + 1):ncol(subject)) {
+    x <- subject[[i]]
+    y <- subject[[j]]
+    
+    x_label <- colnames(subject)[i]
+    y_label <- colnames(subject)[j]
+    
+    p <- plot_scatter(subject, x, y, x_label=x_label, y_label=y_label, x_range=c(-0.45,0.45), y_range=c(-0.45,0.45))
+    plots <- append(plots, list(p))
+  }
+}
+
+plot_corr_del <- wrap_plots(plots, ncol = 3)
+plot_corr_del
+plot_corr_del %>% ggsave(filename = "../figures/deleteome_correlation.svg", dpi = 300, width = 9.5, height = 6)
+
+## SVD removed
+corr_del_svd <- read_tsv("../output_tables/deleteome_correlation_svd-rm.txt", show_col_types=FALSE)
+# Plot all pairs of columns
+subject <- corr_del_svd[-c(1:2)]
+plots <- list()
+for (i in 1:(ncol(subject) - 1)) {
+  for (j in (i + 1):ncol(subject)) {
+    x <- subject[[i]]
+    y <- subject[[j]]
+    
+    x_label <- colnames(subject)[i]
+    y_label <- colnames(subject)[j]
+    
+    p <- plot_scatter(subject, x, y, x_label=x_label, y_label=y_label, x_range=c(-0.45,0.45), y_range=c(-0.45,0.45))
+    plots <- append(plots, list(p))
+  }
+}
+
+plot_corr_del_svd <- wrap_plots(plots, ncol = 3)
+plot_corr_del_svd
+plot_corr_del_svd %>% ggsave(filename = "../figures/deleteome_correlation_svd-rm.svg", dpi = 300, width = 9.5, height = 6)
+```
+
+Correlate deleteome~size-slopes with cell size and growth rate
+
+Process tables
+```{r}
+## Import tables
+size <- read_tsv("../input_tables/soifer_2014_dataset_s1.txt", show_col_types=FALSE) %>% select(-gene_name)
+growth_rate <- read_tsv("../input_tables/growth_rate.txt", col_names = F, show_col_types=FALSE) %>% .[-(1:2),] %>% mutate(X3 = as.numeric(X3), X4 = as.numeric(X4)) %>% rename(gene_id=X1, gene_name=X2, log2_doubling_ratio=X3, similarity=X4)
+corr_del <- read_tsv("../output_tables/deleteome_correlation.txt", show_col_types=FALSE)
+corr_del_svd <- read_tsv("../output_tables/deleteome_correlation_svd-rm.txt", show_col_types=FALSE)
+
+## Normalize and average cell size
+size_norm <- size %>% mutate(Median_FSC_norm=`Median FSC`/mean(`Median FSC`,na.rm = T), Jorgensen_norm=`Jorgensen median volume`/mean(`Jorgensen median volume`,na.rm = T), Ohya_norm=`Ohya mean volume`/mean(`Ohya mean volume`,na.rm = T), Hoose_norm=`Hoose FSC`/mean(`Hoose FSC`,na.rm = T)) %>% mutate(log2_Median_FSC_norm=log2(Median_FSC_norm), log2_Jorgensen_norm=log2(Jorgensen_norm), log2_Ohya_norm=log2(Ohya_norm), log2_Hoose_norm=log2(Hoose_norm)) %>% mutate(log2_size_norm_mean=rowMeans(cbind(log2_Median_FSC_norm, log2_Jorgensen_norm, log2_Ohya_norm, log2_Hoose_norm), na.rm = T))
+
+## Combine gene deletion and cell size/growth rate data
+
+corr_del_size_growth <- corr_del %>% left_join(size_norm %>% select(gene_id, log2_size_norm_mean), by="gene_id") %>% left_join(growth_rate[-c(2,4)], by="gene_id")
+corr_del_svd_size_growth <- corr_del_svd %>% left_join(size_norm %>% select(gene_id, log2_size_norm_mean), by="gene_id") %>% left_join(growth_rate[-c(2,4)], by="gene_id")
+```
+Plotting
+```{r}
+# R = correlation between deleteome and size slopes
+# R original vs growth rate
+subject <- corr_del_size_growth %>% drop_na()
+plots <- list()
+for (i in 3:6) {
+  for (j in 8) {
+    x <- subject[[i]]
+    y <- subject[[j]]
+    
+    x_label <- colnames(subject)[i]
+    y_label <- colnames(subject)[j]
+    
+    p <- plot_scatter(subject, x, y, x_label=x_label, y_label=y_label, x_range=c(-0.4,0.45))
+    plots <- append(plots, list(p))
+  }
+}
+
+corr_del_vs_growth_rate <- wrap_plots(plots, ncol = 2)
+corr_del_vs_growth_rate
+corr_del_vs_growth_rate %>% ggsave(filename = "../figures/deleteome_correlation_vs_growth_rate.svg", dpi = 300, width = 6, height = 4.5)
+
+# R svd removed vs growth rate
+subject <- corr_del_svd_size_growth %>% drop_na()
+plots <- list()
+for (i in 3:6) {
+  for (j in 8) {
+    x <- subject[[i]]
+    y <- subject[[j]]
+    
+    x_label <- colnames(subject)[i]
+    y_label <- colnames(subject)[j]
+    
+    p <- plot_scatter(subject, x, y, x_label=x_label, y_label=y_label, x_range=c(-0.4,0.45))
+    plots <- append(plots, list(p))
+  }
+}
+
+corr_del_svd_vs_growth_rate <- wrap_plots(plots, ncol = 2)
+corr_del_svd_vs_growth_rate
+corr_del_svd_vs_growth_rate %>% ggsave(filename = "../figures/deleteome_correlation_svd-rm_vs_growth_rate.svg", dpi = 300, width = 6, height = 4.5)
+
+# R original vs log2 normalized average cell sizes
+subject <- corr_del_size_growth %>% drop_na()
+plots <- list()
+for (i in 3:6) {
+  for (j in 7) {
+    x <- subject[[i]]
+    y <- subject[[j]]
+    
+    x_label <- colnames(subject)[i]
+    y_label <- "Log2 Normalized Cell Size"
+    
+    p <- plot_scatter(subject, x, y, x_label=x_label, y_label=y_label, x_range=c(-0.4,0.45), y_range=c(-0.3,0.55))
+    plots <- append(plots, list(p))
+  }
+}
+
+corr_del_vs_cell_size <- wrap_plots(plots, ncol = 2)
+corr_del_vs_cell_size
+corr_del_vs_cell_size %>% ggsave(filename = "../figures/deleteome_correlation_vs_cell_size.svg", dpi = 300, width = 6, height = 4.5)
+
+# R svd removed vs log2 normalized average cell sizes
+subject <- corr_del_svd_size_growth %>% drop_na()
+plots <- list()
+for (i in 3:6) {
+  for (j in 7) {
+    x <- subject[[i]]
+    y <- subject[[j]]
+    
+    x_label <- colnames(subject)[i]
+    y_label <- "Log2 Normalized Cell Size"
+    
+    p <- plot_scatter(subject, x, y, x_label=x_label, y_label=y_label, x_range=c(-0.4,0.45), y_range=c(-0.3,0.55))
+    plots <- append(plots, list(p))
+  }
+}
+
+corr_del_svd_vs_cell_size <- wrap_plots(plots, ncol = 2)
+corr_del_svd_vs_cell_size
+corr_del_svd_vs_cell_size %>% ggsave(filename = "../figures/deleteome_correlation_svd-rm_vs_cell_size.svg", dpi = 300, width = 6, height = 4.5)
+```
+
+Remove growth rate and cell size signatures using linear regression
+
+Remove growth rate signature
+```{r}
+del_size_growth_long <- df_del_long %>% mutate(gene_name = toupper(gene_deleted)) %>% left_join(., corr_del_size_growth %>% select(gene_name, log2_size_norm_mean, log2_doubling_ratio), by = "gene_name") %>% select(gene_id, gene_deleted, FC, log2_size_norm_mean, log2_doubling_ratio) %>% unite(., sample, c(gene_id, gene_deleted), sep = "_", na.rm=TRUE, remove=FALSE) %>% left_join(., df_del_svd_long %>% unite(., sample, c(gene_id, gene_deleted), sep = "_", na.rm=TRUE, remove=FALSE) %>% select(sample, FC), by = "sample", suffix = c("", "_svd")) %>% select(-sample)
+
+del_size_growth_long_svd <- df_del_svd_long %>% mutate(gene_name = toupper(gene_deleted)) %>% left_join(., corr_del_svd_size_growth %>% select(gene_name, log2_size_norm_mean, log2_doubling_ratio), by = "gene_name") %>% select(gene_id, gene_deleted, FC, log2_size_norm_mean, log2_doubling_ratio) %>% unite(., sample, c(gene_id, gene_deleted), sep = "_", na.rm=TRUE, remove=FALSE) %>% left_join(., df_del_long %>% unite(., sample, c(gene_id, gene_deleted), sep = "_", na.rm=TRUE, remove=FALSE) %>% select(sample, FC), by = "sample", suffix = c("_svd", "")) %>% select(-sample)
+
+rm_growth_lm <- del_size_growth_long %>% nest(data = c(-gene_id)) %>% slope_fit(a="FC",b="log2_doubling_ratio") %>% unnest(tidied_fit) %>% filter(term!="(Intercept)") %>% mutate(intercept = map_dbl(fit, ~ .x$coefficients["(Intercept)"])) %>% select(gene_id, data, estimate, std.error, intercept) %>% unnest(data) %>% mutate(estimate_FC_growth = estimate*log2_doubling_ratio+intercept, FC_sub_growth = FC-estimate_FC_growth)
+
+# Correlation
+
+df_corr <- rm_growth_lm %>% pivot_wider(id_cols=c("gene_id"), names_from="gene_deleted", values_from=c("FC_sub_growth"), values_fn = ~ mean(.x, na.rm = TRUE)) %>% full_join(df_corr_1, ., by = "gene_id")
+
+rcorr_results <- df_corr %>% dplyr::select(where(is.numeric)) %>% as.matrix() %>% Hmisc::rcorr(type = "pearson")
+
+cor_matrix_r <- rcorr_results$r %>% as.data.frame() %>% rownames_to_column("var1") %>% gather(var2, correlation, -var1)
+
+corr_del_growth_rm <- cor_matrix_r %>% filter(str_detect(var1, "elutriation-arrest|G1-arrest|size-mutants") & !str_detect(var2, "elutriation-arrest|G1-arrest|size-mutants")) %>% pivot_wider(names_from='var1', values_from=correlation) %>% mutate(gene_name=toupper(var2)) %>% left_join(index, by = "gene_name") %>% select(gene_name, gene_id, everything(), -var2)
+
+# Export correlations
+corr_del_growth_rm %>% write_tsv("../output_tables/deleteome_correlation_growth-rm.txt")
+```
+Remove cell size signature based on data with growth signature removed by linear regression
+```{r, warning=FALSE}
+rm_size_growth <- rm_growth_lm %>% select(-estimate, -std.error, -intercept) %>% nest(data = c(-gene_id)) %>% slope_fit(a="FC_sub_growth",b="log2_size_norm_mean") %>% unnest(tidied_fit) %>% filter(term!="(Intercept)") %>% mutate(intercept = map_dbl(fit, ~ .x$coefficients["(Intercept)"])) %>% select(gene_id, data, estimate, std.error, intercept) %>% unnest(data) %>% mutate(estimate_FC_growth_size = estimate*log2_size_norm_mean+intercept, FC_sub_growth_size = FC_sub_growth-estimate_FC_growth_size)
+
+# Correlation
+
+df_corr <- rm_size_growth %>% pivot_wider(id_cols=c("gene_id"), names_from="gene_deleted", values_from=c("FC_sub_growth_size"), values_fn = ~ mean(.x, na.rm = TRUE)) %>% full_join(df_corr_1, ., by = "gene_id")
+
+rcorr_results <- df_corr %>% dplyr::select(where(is.numeric)) %>% as.matrix() %>% Hmisc::rcorr(type = "pearson")
+
+cor_matrix_r <- rcorr_results$r %>% as.data.frame() %>% rownames_to_column("var1") %>% gather(var2, correlation, -var1)
+
+corr_del_growth_size_rm <- cor_matrix_r %>% filter(str_detect(var1, "elutriation-arrest|G1-arrest|size-mutants") & !str_detect(var2, "elutriation-arrest|G1-arrest|size-mutants")) %>% pivot_wider(names_from='var1', values_from=correlation) %>% mutate(gene_name=toupper(var2)) %>% left_join(index, by = "gene_name") %>% select(gene_name, gene_id, everything(), -var2)
+
+# Export correlations
+corr_del_growth_size_rm %>% write_tsv("../output_tables/deleteome_correlation_growth-size-rm.txt")
+```
+Remove cell size signature based on svd removed data
+```{r, warning=FALSE}
+rm_size_svd <- del_size_growth_long_svd %>% nest(data = c(-gene_id)) %>% slope_fit(a="FC_svd",b="log2_size_norm_mean") %>% unnest(tidied_fit) %>% filter(term!="(Intercept)") %>% mutate(intercept = map_dbl(fit, ~ .x$coefficients["(Intercept)"])) %>% select(gene_id, data, estimate, std.error, intercept) %>% unnest(data) %>% mutate(estimate_FC_svd_size = estimate*log2_size_norm_mean+intercept, FC_sub_svd_size = FC_svd-estimate_FC_svd_size)
+
+# Correlation
+
+df_corr <- rm_size_svd %>% pivot_wider(id_cols=c("gene_id"), names_from="gene_deleted", values_from=c("FC_sub_svd_size"), values_fn = ~ mean(.x, na.rm = TRUE)) %>% full_join(df_corr_1, ., by = "gene_id")
+
+rcorr_results <- df_corr %>% dplyr::select(where(is.numeric)) %>% as.matrix() %>% Hmisc::rcorr(type = "pearson")
+
+cor_matrix_r <- rcorr_results$r %>% as.data.frame() %>% rownames_to_column("var1") %>% gather(var2, correlation, -var1)
+
+corr_del_svd_size_rm <- cor_matrix_r %>% filter(str_detect(var1, "elutriation-arrest|G1-arrest|size-mutants") & !str_detect(var2, "elutriation-arrest|G1-arrest|size-mutants")) %>% pivot_wider(names_from='var1', values_from=correlation) %>% mutate(gene_name=toupper(var2)) %>% left_join(index, by = "gene_name") %>% select(gene_name, gene_id, everything(), -var2)
+
+# Export correlations
+corr_del_svd_size_rm %>% write_tsv("../output_tables/deleteome_correlation_svd-size-rm.txt")
+```
+Scatter plots (between experiments)
+```{r, warning=FALSE, error=FALSE}
+## slow growth signature removed by linear regression
+corr_del_growth_rm <- read_tsv("../output_tables/deleteome_correlation_growth-rm.txt", show_col_types=FALSE)
+# Plot all pairs of columns
+subject <- corr_del_growth_rm[-c(1:2)]
+plots <- list()
+for (i in 1:(ncol(subject) - 1)) {
+  for (j in (i + 1):ncol(subject)) {
+    x <- subject[[i]]
+    y <- subject[[j]]
+    
+    x_label <- colnames(subject)[i]
+    y_label <- colnames(subject)[j]
+    
+    p <- plot_scatter(subject, x, y, x_label=x_label, y_label=y_label, x_range=c(-0.45,0.45), y_range=c(-0.45,0.45))
+    plots <- append(plots, list(p))
+  }
+}
+
+plot_corr_del_growth_rm <- wrap_plots(plots, ncol = 3)
+plot_corr_del_growth_rm
+plot_corr_del_growth_rm %>% ggsave(filename = "../figures/deleteome_correlation_growth-rm.svg", dpi = 300, width = 9.5, height = 6)
+
+## cell size and slow growth signature removed by linear regression
+corr_del_growth_size_rm <- read_tsv("../output_tables/deleteome_correlation_growth-size-rm.txt", show_col_types=FALSE)
+# Plot all pairs of columns
+subject <- corr_del_growth_size_rm[-c(1:2)]
+plots <- list()
+for (i in 1:(ncol(subject) - 1)) {
+  for (j in (i + 1):ncol(subject)) {
+    x <- subject[[i]]
+    y <- subject[[j]]
+    
+    x_label <- colnames(subject)[i]
+    y_label <- colnames(subject)[j]
+    
+    p <- plot_scatter(subject, x, y, x_label=x_label, y_label=y_label, x_range=c(-0.45,0.45), y_range=c(-0.45,0.45))
+    plots <- append(plots, list(p))
+  }
+}
+
+plot_corr_del_growth_size_rm <- wrap_plots(plots, ncol = 3)
+plot_corr_del_growth_size_rm
+plot_corr_del_growth_size_rm %>% ggsave(filename = "../figures/deleteome_correlation_growth-size-rm.svg", dpi = 300, width = 9.5, height = 6)
+
+## cell size signature and svd removed
+corr_del_svd_size_rm <- read_tsv("../output_tables/deleteome_correlation_svd-size-rm.txt", show_col_types=FALSE)
+# Plot all pairs of columns
+subject <- corr_del_svd_size_rm[-c(1:2)]
+plots <- list()
+for (i in 1:(ncol(subject) - 1)) {
+  for (j in (i + 1):ncol(subject)) {
+    x <- subject[[i]]
+    y <- subject[[j]]
+    
+    x_label <- colnames(subject)[i]
+    y_label <- colnames(subject)[j]
+    
+    p <- plot_scatter(subject, x, y, x_label=x_label, y_label=y_label, x_range=c(-0.45,0.45), y_range=c(-0.45,0.45))
+    plots <- append(plots, list(p))
+  }
+}
+
+plot_corr_del_svd_size_rm <- wrap_plots(plots, ncol = 3)
+plot_corr_del_svd_size_rm
+plot_corr_del_svd_size_rm %>% ggsave(filename = "../figures/deleteome_correlation_svd-size-rm.svg", dpi = 300, width = 9.5, height = 6)
+```
+
+Correlate deleteome~size-slopes with cell size and growth rate
+
+Process tables
+```{r}
+## Import tables
+corr_del_growth_rm <- read_tsv("../output_tables/deleteome_correlation_growth-rm.txt", show_col_types=FALSE)
+corr_del_growth_size_rm <- read_tsv("../output_tables/deleteome_correlation_growth-size-rm.txt", show_col_types=FALSE)
+corr_del_svd_size_rm <- read_tsv("../output_tables/deleteome_correlation_svd-size-rm.txt", show_col_types=FALSE)
+
+## Combine gene deletion and cell size/growth rate data
+
+corr_del_growth_rm_size_growth <- corr_del_growth_rm %>% select(gene_name, gene_id, everything()) %>% left_join(size_norm %>% select(gene_id, log2_size_norm_mean), by="gene_id") %>% left_join(growth_rate[-c(2,4)], by="gene_id")
+corr_del_growth_size_rm_size_growth <- corr_del_growth_size_rm %>% select(gene_name, gene_id, everything()) %>% left_join(size_norm %>% select(gene_id, log2_size_norm_mean), by="gene_id") %>% left_join(growth_rate[-c(2,4)], by="gene_id")
+corr_del_svd_size_rm_size_growth <- corr_del_svd_size_rm %>% select(gene_name, gene_id, everything()) %>% left_join(size_norm %>% select(gene_id, log2_size_norm_mean), by="gene_id") %>% left_join(growth_rate[-c(2,4)], by="gene_id")
+```
+Plotting
+```{r}
+# R slow growth signature removed by linear regression vs growth rate
+subject <- corr_del_growth_rm_size_growth %>% drop_na()
+plots <- list()
+for (i in 3:6) {
+  for (j in 8) {
+    x <- subject[[i]]
+    y <- subject[[j]]
+    
+    x_label <- colnames(subject)[i]
+    y_label <- colnames(subject)[j]
+    
+    p <- plot_scatter(subject, x, y, x_label=x_label, y_label=y_label, x_range=c(-0.4,0.45))
+    plots <- append(plots, list(p))
+  }
+}
+
+corr_del_growth_rm_vs_growth_rate <- wrap_plots(plots, ncol = 2)
+corr_del_growth_rm_vs_growth_rate
+corr_del_growth_rm_vs_growth_rate %>% ggsave(filename = "../figures/deleteome_correlation_growth-rm_vs_growth_rate.svg", dpi = 300, width = 6, height = 4.5)
+
+# R slow growth signature removed by linear regression vs log2 normalized average cell sizes
+subject <- corr_del_growth_rm_size_growth %>% drop_na()
+plots <- list()
+for (i in 3:6) {
+  for (j in 7) {
+    x <- subject[[i]]
+    y <- subject[[j]]
+    
+    x_label <- colnames(subject)[i]
+    y_label <- "Log2 Normalized Cell Size"
+    
+    p <- plot_scatter(subject, x, y, x_label=x_label, y_label=y_label, x_range=c(-0.4,0.45), y_range=c(-0.3,0.55))
+    plots <- append(plots, list(p))
+  }
+}
+
+corr_del_growth_rm_vs_cell_size <- wrap_plots(plots, ncol = 2)
+corr_del_growth_rm_vs_cell_size
+corr_del_growth_rm_vs_cell_size %>% ggsave(filename = "../figures/deleteome_correlation_growth-rm_vs_cell_size.svg", dpi = 300, width = 6, height = 4.5)
+
+# R cell size and slow growth signature removed by linear regression vs log2 normalized average cell sizes
+subject <- corr_del_growth_size_rm_size_growth %>% drop_na()
+plots <- list()
+for (i in 3:6) {
+  for (j in 7) {
+    x <- subject[[i]]
+    y <- subject[[j]]
+    
+    x_label <- colnames(subject)[i]
+    y_label <- "Log2 Normalized Cell Size"
+    
+    p <- plot_scatter(subject, x, y, x_label=x_label, y_label=y_label, x_range=c(-0.4,0.45), y_range=c(-0.3,0.55))
+    plots <- append(plots, list(p))
+  }
+}
+
+corr_del_growth_size_rm_vs_cell_size <- wrap_plots(plots, ncol = 2)
+corr_del_growth_size_rm_vs_cell_size
+corr_del_growth_size_rm_vs_cell_size %>% ggsave(filename = "../figures/deleteome_correlation_growth-size-rm_vs_cell_size.svg", dpi = 300, width = 6, height = 4.5)
+
+# R cell size signature and svd removed vs log2 normalized average cell sizes
+subject <- corr_del_svd_size_rm_size_growth %>% drop_na()
+plots <- list()
+for (i in 3:6) {
+  for (j in 7) {
+    x <- subject[[i]]
+    y <- subject[[j]]
+    
+    x_label <- colnames(subject)[i]
+    y_label <- "Log2 Normalized Cell Size"
+    
+    p <- plot_scatter(subject, x, y, x_label=x_label, y_label=y_label, x_range=c(-0.4,0.45), y_range=c(-0.3,0.55))
+    plots <- append(plots, list(p))
+  }
+}
+
+corr_del_svd_size_rm_vs_cell_size <- wrap_plots(plots, ncol = 2)
+corr_del_svd_size_rm_vs_cell_size
+corr_del_svd_size_rm_vs_cell_size %>% ggsave(filename = "../figures/deleteome_correlation_svd-size-rm_vs_cell_size.svg", dpi = 300, width = 6, height = 4.5)
+```

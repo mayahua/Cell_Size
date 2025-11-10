@@ -1,0 +1,97 @@
+---
+title: "Match gene name and gene id for deletome"
+author: "MH"
+date: "2024-06-24"
+output: html_document
+---
+```{r setup}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path)) 
+rm(list=ls())
+library(broom)
+library(MASS)
+library(tidyverse)
+library(rvest)
+library(dplyr)
+library(stringr)
+library(readxl)
+```
+Process tables
+```{r}
+# Load tables
+corr_del <- read_tsv("../output_tables/correlation_gene-deletion.txt", show_col_types=FALSE) %>% select(-gene_id)
+match_index <- read_excel("../input_tables/deleteome_mutants_information.xlsx") %>% select(1, 2) %>% rename(gene_name=gene, gene_id=`orf name`)
+size_match <- read_tsv("../input_tables/soifer_2014_dataset_s1.txt", show_col_types=FALSE) %>% select(gene_id, gene_name)
+
+# Match gene name with gene id, if no matched gene id and gene name is already gene id, paste gene_name to gene_id
+corr_del_match <- corr_del %>% left_join(match_index, by = "gene_name") %>% left_join(size_match, by = "gene_name", suffix = c("", ".size_match")) %>% mutate(gene_id = coalesce(gene_id, gene_id.size_match)) %>% select(-gene_id.size_match) %>% mutate(gene_id = if_else(is.na(gene_id) & str_detect(gene_name, "^[A-Za-z]+\\d+[A-Za-z]+$"), gene_name, gene_id))
+
+# Get gene names without matching ids
+gene_alias <- corr_del_match %>% filter(if_any(everything(), is.na) | !str_detect(gene_id, "^[A-Za-z]+\\d+[A-Za-z]+(-[A-Za-z]+)?$")) %>% pull(gene_name)
+```
+Function to match gene names and gene ids for yeast
+```{r}
+# Define the function to search and extract gene information
+match_gene <- function(gene_alias) {
+  # Construct the search URL
+  search_url <- paste0("https://www.yeastgenome.org/search?q=", gene_alias, "&category=locus")
+  
+  # Read the HTML content of the search results page
+  search_page <- read_html(search_url)
+  
+  # Extract the total number of results
+  total_pattern <- '"total":\\s*\\{\\s*"value":\\s*(\\d+)'
+  total_results <- search_page %>% 
+    html_text() %>% 
+    str_extract(total_pattern) %>% 
+    str_match(total_pattern) %>% 
+    .[, 2] %>% 
+    as.numeric()
+  
+  if (is.na(total_results) || total_results != 1) {
+    # If no results or more than one result, return a data frame with NAs
+    return(data.frame(gene_alias = gene_alias, gene_name = NA, gene_id = NA, stringsAsFactors = FALSE))
+  } else {
+    # If exactly one result, extract and return the gene info
+    pattern <- '"name":\\s*"([A-Z0-9]+\\s*/\\s*[A-Z0-9]+)"'
+    gene_info <- search_page %>%
+      html_nodes(xpath = "//script[contains(text(), 'window.bootstrappedSearchResults')]") %>%
+      html_text() %>%
+      str_extract_all(pattern) %>% 
+      str_match(pattern) %>%
+      .[, 2] %>%
+      str_split(" / ", simplify = TRUE)
+    
+    if (ncol(gene_info) == 2) {
+      return(data.frame(gene_alias = gene_alias, gene_name = gene_info[1], gene_id = gene_info[2], stringsAsFactors = FALSE))
+    } else {
+      # If splitting doesn't result in two columns, return NAs for gene_name and gene_id
+      return(data.frame(gene_alias = gene_alias, gene_name = NA, gene_id = NA, stringsAsFactors = FALSE))
+    }
+  }
+}
+
+# Initialize an empty data frame to store results
+matched_gene <- data.frame()
+
+# Loop through each gene name without matching id and get gene id
+for (alias in gene_alias) {
+  gene_info <- match_gene(alias)
+  matched_gene <- bind_rows(matched_gene, gene_info)
+}
+```
+Manually check non-matched genes
+```{r}
+# Manually pair missing gene ids after loop search
+supplement <- data.frame(
+  gene_alias = c("TLC1","LUG1","MED3","CMS1","SSN6","CDK8","HSN1","CAP"),
+  gene_name = c("TLC1","LUG1","PGD1","CMS1","CYC8","SSN3","YHR127W","SRV2"),
+  gene_id = c("YNCB0010W","YCR087C-A","YGL025C","YLR003C","YBR112C","YPL042C","YHR127W","YNL138W")
+)
+
+matched_gene_checked <- matched_gene %>% drop_na() %>% bind_rows(., supplement)
+
+# Create new index with full matches
+new_index <- matched_gene_checked %>% select(-gene_name) %>% rename(gene_name=gene_alias) %>% left_join(corr_del_match, ., by = "gene_name", suffix = c("", "_supp")) %>% mutate(gene_id = ifelse(!is.na(gene_id_supp), gene_id_supp, gene_id)) %>% select(-gene_id_supp) %>% select(gene_name, gene_id)
+
+new_index %>% write_tsv("../input_tables/deleteome_index.txt")
+```

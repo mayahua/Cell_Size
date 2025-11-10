@@ -1,0 +1,135 @@
+---
+title: "TPM table for spike-in normalised RNA-seq of size mutants SCGE"
+author: "MH"
+date: "2024-06-14"
+output: html_document
+---
+```{r setup}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path)) #assumes we are in scripts folder 
+rm(list=ls())
+library(MASS)
+library(plotly)
+library(broom)
+library(corrr)
+library(nls.multstart)
+library(viridis)
+library(tidyverse)
+load('../../r_functions/functions.rda')
+```
+
+load tables, visualize sample info
+```{r}
+# Create output plots directories
+if (!dir.exists("../figures/")) {
+  dir.create("../figures/", recursive = TRUE)
+}
+
+#load data and annotaiton tables
+df1 <- read_tsv("../input_tables/express-1.5.1.Candida+cerevisiae.2x50mers.TPM_with_both_names.table.txt", show_col_types=FALSE) %>% rename("species"=1, "gene_name"=2, "gene_id"=3)
+verified_ORF <- read_tsv("../input_tables/230128_verified_ORF.txt", show_col_types=FALSE) %>% dplyr::select(-"species")
+sample_info <- read_tsv("../input_tables/sample_info.txt", show_col_types=FALSE)
+
+#histogram of mean cell size for each strain
+mean_cell_size <- sample_info %>% group_by(strain_id) %>% summarize(mean_size = mean(mean_cell_size))
+strain_size <- ggplot(mean_cell_size, aes(x = strain_id, y = mean_size)) +
+  geom_bar(stat = "identity", fill = "steelblue", alpha=0.8) +
+  geom_text(aes(label = round(mean_size, 2)), vjust = -0.5, color = "black", alpha=0.6) +
+  labs(x = "Size Mutants Strain", y = "Mean Cell Size (fL)") +
+  scale_x_discrete(labels = c("MS1" = "MS1-WT", "MS80" = "MS80-whi5Δ", "MS81" = "MS81-cln3Δ")) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+strain_size
+strain_size %>% ggsave(filename = "../figures/sample_size-mutants_RNA.svg", dpi = 300, width = 5, height = 4.5)
+```
+
+merge TPM data with annotation data, calculate global ratios, recalculate TPMs for one species and normalise
+```{r}
+#join dataset to annotation file, filter for genes with TPM > 0 in all samples and pivot TPM longer
+df2 <-  left_join(df1, verified_ORF, by="gene_id") %>% filter_at(vars(contains("exp")), all_vars(.>0)) %>% pivot_longer(cols=colnames(dplyr::select(., contains("exp"))), names_to="sample", values_to="TPM")
+
+#get TPM sum for each species, combine with sample info and calculate spike-in ratio, RNA per genome and  RNA per cell
+norm_table1 <- df2 %>% filter(verified_ORF==TRUE) %>% group_by(species, sample) %>% summarise(TPMsum=sum(TPM)) %>% pivot_wider(names_from=species, names_glue="{species}_{.value}", values_from="TPMsum") %>% mutate(spikein_ratio=S_cerevisiae_TPMsum/Candida_TPMsum) %>% left_join(., sample_info, by="sample") %>% mutate(RNA_per_genome=spikein_ratio/DNA_ratio)%>% mutate(RNA_per_cell=RNA_per_genome*DNA_per_cell)
+
+#average replicates, combine with unaveraged values and normalise to minimum value
+norm_table_2 <- norm_table1 %>% group_by(strain_id, sample_short) %>% summarise(av_RNA_per_cell = mean(RNA_per_cell)) %>% left_join(norm_table1, ., by=c("strain_id", "sample_short")) %>% mutate(RNA_per_cell_norm=RNA_per_cell/min(av_RNA_per_cell))
+
+#average the mean cell size within experiments, MCSe = mean cell size per experiment, MCS = Mean Cell Size
+norm_table <- norm_table_2 %>% group_by(experiment) %>% summarise(exp_av_cell_size = mean(mean_cell_size)) %>% left_join(norm_table_2, ., by=c('experiment'))
+
+#filter for budding yeast (sc) reads calculate TPM with and without normalisation
+df_sc_1 <- left_join(df2, norm_table, by="sample") %>% filter(., verified_ORF==TRUE, species == "S_cerevisiae") %>% mutate(TPMsc=((TPM/S_cerevisiae_TPMsum)*10^6)) %>% dplyr::select(-species, -verified_ORF)
+
+#normalise all values to the mean and log
+df_sc_sum <- df_sc_1 %>% summarise(.by=c(gene_id, gene_name), TPMmean=mean(TPMsc), TPMmin=min(TPMsc)) %>% left_join(., summarise(filter(df_sc_1, strain_id=="MS1"), .by=c(gene_id), TPMrefm=mean(TPMsc))) %>% left_join(., summarise(filter(df_sc_1, strain_id=="MS80" | strain_id=="MS63-low-WHI5"), .by=c(gene_id), TPMrefs=mean(TPMsc)))
+
+df_sc <- left_join(df_sc_1, df_sc_sum, gene_name, by=c('gene_id', 'gene_name')) %>% mutate(TPMnorm=TPMsc/TPMmean) %>% mutate(log2TPMnorm = log2(TPMsc/TPMmean)) %>% mutate(log2_norm_cell_size = log2(mean_cell_size/exp_av_cell_size))
+```
+
+PCA
+```{r}
+#principle component analysis on all genes with minimum TPM > 5
+df_pca <- df_sc %>% filter(TPMmin>5) %>% dplyr::select(gene_id, sample, log2TPMnorm) %>% pivot_wider(id_cols=c("gene_id"), names_from="sample", values_from=c("log2TPMnorm"))
+
+pca <- df_pca %>% dplyr::select(., where(is.numeric)) %>% prcomp(scale.=FALSE, center=FALSE)
+
+pca_results_variance <- summary(pca)$importance[2,] %>% as.data.frame()
+pca_results_samples <- as.data.frame(pca$rotation) %>% rownames_to_column(var="sample") %>% left_join(., sample_info)
+pca_results_genes <- bind_cols(dplyr::select(df_pca, gene_id), as.data.frame(pca$x)) 
+
+label<-labs(y="PC1", x="Mean Cell Size (fL)",color="Strain ID", title="Size-mutants RNA") 
+
+plot_pca <- pca_results_samples %>% ggplot(aes(x=mean_cell_size, y=PC1, color=strain_id, text=paste("", sample_short))) + geom_point( size=3, alpha=0.85) +  viridis::scale_color_viridis(discrete=TRUE) + coord_fixed(ratio = 100) + label
+plot_pca
+plot_pca %>% ggsave(filename = "../figures/PC1-v-size_size-mutants_RNA.svg", dpi = 300, width = 4, height = 3)
+```
+
+CORRELATION ANALYASIS
+```{r}
+#calcualte correlations between selected TPM values, convert to tidy format and plot
+df_corr <- df_sc %>% filter(TPMmin>2) %>% select(gene_id, sample_short, var=log2TPMnorm) %>% pivot_wider(id_cols=c("gene_id") , names_from="sample_short", values_from=c("var"))
+
+plot_cor <- plot_corr(df_corr, title="Size mutants RNA", angle=60, show_corr=F)
+plot_cor
+plot_cor %>% ggsave(filename = "../figures/pearson_heatmap_size-mutants_RNA.svg", dpi = 300, width = 6, height = 4.5)
+```
+
+Linear regression
+```{r}
+# Construct linear models for average of replicates, save the slope and SE 
+df_fit_pooled <- df_sc %>% nest(data = c(-gene_id)) %>% slope_fit(a="log2TPMnorm", b="log2_norm_cell_size") %>% add_column(replicate="pooled")
+
+# Construct linear models for each replicate separately
+df_fit_exp <- df_sc %>% nest(data = c(-gene_id,-replicate)) %>% slope_fit(a="log2TPMnorm", b="log2_norm_cell_size")
+
+df_slopes <- bind_rows(df_fit_exp, df_fit_pooled) %>% unnest(tidied_fit) %>% filter(term!="(Intercept)") %>% dplyr::select(gene_id, replicate, "slope"=estimate, "slope_SE"=std.error)
+
+# Export summary and slopes
+df_export <- df_slopes %>% left_join(., df_sc_sum, by = c("gene_id")) # %>% left_join(., pca_results_genes %>% select(gene_id, PC1), by="gene_id") 
+
+df_export %>% write_tsv("../../size_slopes/input_tables/size-mutants_RNA_slopes.txt")
+```
+
+plotting (slope vs PC1)
+```{r}
+df_sum_wide <- df_slopes %>% pivot_wider(id_cols=c("gene_id"), names_from="replicate", values_from=c("slope", "slope_SE")) %>% left_join(., pca_results_genes, by="gene_id") %>% left_join(., df_sc_sum, by = c("gene_id"))
+
+df <- df_sum_wide %>% filter(TPMmin>5) %>% rowwise()
+  
+x <- df$`slope_pooled`
+y <- df$PC1
+z <- df$`slope_pooled`
+
+label<- labs(title="Size mutants RNA", x="Slope", y="PC1", color="SE") 
+axes <- lims(x= c(-2, 2), y = c(-8, 6))
+
+bin_sum <- Hmisc::cut2(x, g=50) %>% bind_cols(., x, y) %>% dplyr::rename("bins"=1,"x"=2,"y"=3) %>% drop_na() %>% dplyr::group_by(bins) %>% summarise(sd=sd(y, na.rm = TRUE), x=mean(x), y=mean(y), n = n())
+
+points <- df %>% geom_point(mapping = aes(x=(x), y=(y), color=(z), text=paste("gene_name:", gene_name)),  size=2, alpha=0.35) 
+binned_line <- bin_sum %>% geom_line(mapping = aes(x=(x), y=(y)))
+annotate <- annotate(geom = 'text', label =  paste("pearson =", (corrr::correlate(x=x, y=y, method="pearson")$x %>% round(digits = 3))), x=-Inf, y=Inf, hjust=-0.15, vjust=2.5)
+color <- scale_color_viridis(begin=0.15, end=1, limits=c(), oob=scales::squish)
+
+plot_slope <- ggplot() + points + label + annotate + color + axes + binned_line + coord_fixed(ratio = 0.25)
+plot_slope
+plot_slope %>% ggsave(filename = "../figures/slope-v-PC1_size-mutants_RNA.svg", dpi = 300, width = 4, height = 3)
+```

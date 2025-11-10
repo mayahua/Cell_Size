@@ -1,0 +1,94 @@
+---
+title: "TPM ratios for EU enrich optimisation / MS95-MS96"
+author: "MH"
+date: "2024-06-26"
+output: html_document
+---
+```{r setup}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+rm(list=ls())
+library(broom)
+library(corrr)
+library(tidyverse)
+library(nls.multstart)
+load('../../r_functions/functions.rda')
+
+# Create output table directory
+if (!dir.exists("../output_tables/")) {
+  dir.create("../output_tables/", recursive = TRUE)
+}
+```
+
+load TPM data, merge with annotation data and normalize date two way - scTPM and scTPMnorm
+```{r}
+df1 <- read_tsv("../input_tables/express-1.5.1.pombe+cerevisiae.2x50mers.TPM.SPBC.table.txt", show_col_types=FALSE) %>% rename("species"=1, "gene_name"=2, "gene_id"=3)
+annotation <- read_tsv("../input_tables/2230128verifiedORF.txt", show_col_types=FALSE) %>% dplyr::select(-"species")
+sample_info <- read_tsv("../input_tables/sample_info.txt", show_col_types=FALSE)
+
+#join dataset to annotation file and pivot longer to move all TPMs into a single column
+df2 <-  left_join(df1, annotation, by="gene_id") %>% filter_at(vars(contains("exp")), all_vars(.>0)) %>% pivot_longer(cols=colnames(dplyr::select(., contains("exp"))), names_to="sample", values_to="TPM")
+
+#get TPM sum for each species and combine with sample info
+norm_table <- df2 %>% filter(verified_ORF==TRUE) %>% group_by(species, sample) %>% summarise(TPMsum=sum(TPM)) %>% pivot_wider(names_from=species, names_glue="{species}_{.value}", values_from="TPMsum") %>% mutate(sp_ratio=S_cerevisiae_TPMsum/S_pombe_TPMsum) %>% left_join(., sample_info, by="sample")
+
+norm_table2 <- norm_table %>% filter(fraction=="input") %>% dplyr::select(sample_id, input_sp_ratio=sp_ratio) %>% right_join(., norm_table, by="sample_id") %>% mutate(norm_ratio=sp_ratio/input_sp_ratio)
+
+#filter for budding yeast reads calculate TPM with and without normalisation
+df_sc <- df2 %>% left_join(., norm_table2, by="sample") %>% filter(., verified_ORF==TRUE, species=="S_cerevisiae") %>% mutate(TPMsc=((TPM/S_cerevisiae_TPMsum)*10^6)) %>% mutate(TPMnorm=(TPMsc*norm_ratio))
+
+#background sub. on EU labelled samples by subtracting background sample
+df_bg <- df_sc %>% filter(fraction=="EU", EUconc=="0uM") %>% dplyr::select("gene_id", "experiment_strain_media", bg_y="TPMnorm")
+
+df_EU <- df_sc %>% filter(fraction=="EU") %>% dplyr::select("sample", "gene_id", "experiment","strain", "media", "experiment_strain_media", "EUconc", "strain_media_EUconc", "timepoint", t="time", y="TPMnorm") %>% left_join(., df_bg, by=c("gene_id", "experiment_strain_media")) %>% mutate(y_bgsub=y-bg_y)
+
+df_EU_background <- df_EU %>% mutate(bg_ratio=bg_y/y) %>% filter(timepoint=="T0") %>% summarise (., .by=c(gene_id, strain_media_EUconc) , mean_bg = mean(bg_ratio))
+
+#T0 normalisation for EU labelled samples by dividing through T0 sample in each time couse
+df_T0 <- filter(df_EU, timepoint=="T0") %>% dplyr::select("gene_id", "experiment_strain_media", "EUconc", y_T0="y", y_T0_bg="y_bgsub") 
+df_EU_norm1 <- df_EU %>% left_join(., df_T0, by=c("gene_id", "experiment_strain_media", "EUconc")) %>% mutate(y_norm_bg=y_bgsub/y_T0_bg, y_norm=y/y_T0)
+df_T4 <- filter(df_EU_norm1, timepoint=="T4") %>% dplyr::select("gene_id", "experiment_strain_media", "EUconc", y_norm_T4="y_norm", y_norm_bg_T4="y_norm_bg") 
+df_EU_norm2 <- df_EU_norm1 %>% left_join(., df_T4, by=c("gene_id", "experiment_strain_media", "EUconc")) 
+```
+
+Exponential fit to all data from combined replicate experiments
+```{r fig.height=4, fig.width=5}
+df_fit_input <- df_EU_norm2 %>% left_join(., df_EU_background, by=c("gene_id", "strain_media_EUconc")) %>% filter(timepoint!="Tbackground") %>% filter(EUconc!="0uM") %>% filter(y_norm_bg_T4 > -0.1, y_norm_bg_T4 < 0.5, mean_bg < 0.2)
+
+fitted <- df_fit_input %>% mutate(weights = (abs(1/y_norm_bg))) %>% nest(data = c(-gene_id, -strain_media_EUconc)) %>% mutate(fit = map(
+data, ~nls_multstart(y_norm_bg ~ SSasymp(t, yplateau, y0, log_k), 
+  data=., modelweights = weights, 
+  iter = 50, na.action = na.omit, supp_errors = 'Y',
+  start_lower = c(yplateau = -0.1, y0 = 1, log_k = -4),
+  start_upper = c(yplateau = 0.4, y0 = 20, log_k = 1),
+  lower = c(yplateau = -0.1, y0 = 0.5, NA))), 
+tidied = map(fit, tidy), augmented = map(fit, augment),) %>% unnest(., tidied) %>% select(-data, -fit, -statistic, -p.value, -augmented)
+
+estimate <- fitted %>% select(-std.error) %>% spread(term, estimate) %>% mutate(k = exp(log_k)) %>%  select(-log_k)
+error <- fitted %>% select(-estimate) %>% spread(term, std.error) %>% select(strain_media_EUconc, gene_id, std_error_k=log_k)
+fit_results <- left_join(estimate, error, by=c("gene_id", "strain_media_EUconc")) %>% mutate(half_life = 0.6931472/k)
+fit_results %>% write_tsv("../output_tables/MS240526_decay_rates_weights_bg_sub_p_-0.4.txt")
+```
+
+calculate normalized FC in decay rate and export
+```{r}
+df_decay <- read_tsv("../output_tables/MS240526_decay_rates_weights_bg_sub_p_-0.4.txt", show_col_types=FALSE) %>% left_join(., read_tsv("../input_tables/experiment_info.txt", show_col_types=FALSE)) %>% left_join(., df_EU_background, by=c("gene_id", "strain_media_EUconc")) %>% filter(strain_media_EUconc != "MS95_SCGEuri-20nM-BE_10uM", mean_bg<0.2) 
+
+df_SE_max <- summarise(.data = df_decay,	max_SE_k = max(std_error_k), .by = c(gene_id, strain_id))
+
+df_decay_FC_1 <- df_decay %>% pivot_wider(id_cols = c(gene_id, strain_id, dataset), names_from = cell_size_group, values_from = c(k, half_life, size_to_DNA_norm)) %>% mutate(half_life_FC = half_life_large / half_life_small)
+
+df_FC_av <- summarise(.data = df_decay_FC_1,	half_life_FC_av = median(half_life_FC, na.rm = TRUE), .by = c(strain_id))
+
+df_decay_FC <- df_decay_FC_1 %>% left_join(., df_SE_max, by = join_by(gene_id, strain_id)) %>% left_join(., df_FC_av, by = join_by(strain_id)) %>% mutate(log2_norm_half_life_FC = log2((half_life_FC / half_life_FC_av)/size_to_DNA_norm_small))
+```
+
+export files for TPM analysis of input samples
+```{r}
+df_decay_FC %>% select(gene_id, dataset, half_life_FC, log2_norm_half_life_FC, max_SE_k) %>% write_tsv("../../size_slopes/input_tables/half_lives_fold_change.txt")
+
+df_sc %>% write_tsv("../output_tables/EU-pulse-chase-experiments_df_sc_240127.txt")
+
+TPMsc_input_sum <- df_sc %>% filter(fraction=="input") %>% group_by(experiment_strain_media, gene_id, gene_name) %>% summarise(meanTPMsc=mean(TPMsc)) %>% pivot_wider(values_from = meanTPMsc, names_from = experiment_strain_media)
+
+TPMsc_input_bg <- df_sc %>% filter(fraction=="input", timepoint=="Tbackground") %>% group_by(experiment_strain_media, gene_id, gene_name) %>% summarise(meanTPMsc=mean(TPMsc)) %>% pivot_wider(values_from = meanTPMsc, names_from = experiment_strain_media)
+```

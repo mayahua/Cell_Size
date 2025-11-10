@@ -1,0 +1,110 @@
+---
+title: "functions"
+author: "MH"
+date: "2024-06-14"
+output: functions that can then be imported into other scripts
+---
+
+Load required package, if not installed then install
+```{r}
+load_pkg <- function(package) {
+  if (!require(package, character.only = TRUE, quietly = TRUE)) {
+    cat(sprintf("Installing package '%s'\n", package))
+    install.packages(package, update = FALSE, force = TRUE)
+  }
+  library(package, character.only = TRUE)
+}
+```
+
+Construct linear models, save the slope and SE
+```{r}
+slope_fit <- function(i,a,b) {i %>% mutate( 
+    fit = map(data, ~rlm(as.formula(paste(a, "~", b)), data = .)),
+    tidied_fit = map(fit, tidy),
+    summary = map(fit, summary.lm)#,rsquared = map(summary, "adj.r.squared") %>% as.numeric()
+    )}
+```
+
+Scatter plot
+```{r}
+plot_scatter <- function(data, x, y, x_label = 'x', y_label = 'y', x_range = NULL, y_range = NULL) {
+
+load_pkg("viridis")
+
+bin_sum <- Hmisc::cut2(x, g=50) %>% bind_cols(., x, y) %>% dplyr::rename("bins"=1,"x"=2,"y"=3) %>% drop_na() %>% dplyr::group_by(bins) %>% summarise(sd=sd(y, na.rm = TRUE), x=mean(x), y=mean(y), n = n())
+   
+points <- data %>% geom_point(mapping = aes(x=(x), y=(y)), color="steelblue", size=1.8, alpha=0.3)
+
+binned_line <- bin_sum %>% geom_line(mapping = aes(x=(x), y=(y)))
+
+annotate_pearson <- annotate(geom = 'text', label = paste("Pearson =", (corrr::correlate(x=x, y=y, method="pearson")$x %>% round(digits = 3))), x=-Inf, y=Inf, hjust=-0.1, vjust=2)
+
+annotate_spearman <- annotate(geom = 'text', label = paste("Spearman =", (corrr::correlate(x=x, y=y, method="spearman")$x %>% round(digits = 3))), x=-Inf, y=Inf, hjust=-0.1, vjust=3)
+
+annotate_n <- geom_text(aes(label = paste("n =", sum(!is.na(x) & !is.na(y))), x=Inf, y=-Inf), hjust = 1.2, vjust = -1.2)
+
+p <- ggplot() + geom_abline(colour = "grey") + labs(x=x_label, y=y_label) + points + annotate_pearson + annotate_spearman + annotate_n + binned_line
+
+if (!is.null(x_range)) {p <- p + xlim(x_range)}
+if (!is.null(y_range)) {p <- p + ylim(y_range)}
+
+return(p)
+}
+```
+
+Correlation matrix plot
+```{r}
+plot_corr <- function(data, corr_type="pearson", limits=c(-1,1), title="", angle=30, show_corr=TRUE) {
+  
+  load_pkg("viridis")
+  load_pkg("Hmisc")
+  
+  rcorr_results <- data %>% dplyr::select(where(is.numeric)) %>% as.matrix() %>% Hmisc::rcorr(type = corr_type)
+
+  cor_matrix_r <- rcorr_results$r %>% as.data.frame() %>% rownames_to_column("var1") %>% gather(var2, correlation, -var1) %>% filter(as.integer(factor(var1)) < as.integer(factor(var2)))
+
+  plot_corr <- ggplot(cor_matrix_r, aes(var1, var2, fill = correlation)) + geom_tile() + theme(panel.background = element_blank()) + labs(title = title, x = "", y = "", fill = corr_type) +  viridis::scale_fill_viridis(discrete = FALSE, limits = limits, oob = scales::squish) + theme(axis.text.x = element_text(angle = angle, hjust = 1), legend.justification = "top") + coord_fixed(ratio = 1)
+  
+  if (show_corr) {
+    plot_corr <- plot_corr + geom_text(aes(label = round(correlation, 2)), color = "white", size = 2)
+  }
+
+  return(plot_corr)
+}
+```
+
+Detect all ggplot objects and save
+```{r}
+save_all_ggplots <- function(directory = "../figures/", width = 6, height = 4.5) {
+  # Make sure ggplot2 is loaded
+  load_pkg("ggplot2")
+  # Create the directory if it doesn't exist
+  if (!dir.exists(directory)) {
+    dir.create(directory, recursive = TRUE)
+  }
+  
+  # List all objects in the environment
+  all_objects <- ls(envir = .GlobalEnv)
+  
+  # Filter the list to get only ggplot objects
+  ggplot_objects <- all_objects[sapply(all_objects, function(x) inherits(get(x), "ggplot"))]
+  
+  # Add ggplot objects to a list
+  plots <- lapply(ggplot_objects, get)
+  names(plots) <- ggplot_objects
+  
+  # Generate filenames based on plot names
+  filenames <- paste0(directory, ggplot_objects, ".svg")
+  
+  # Loop through each plot and save it
+  for (i in seq_along(plots)) {
+    ggsave(plot = plots[[i]], filename = filenames[i], dpi = 300, width = width, height = height)
+  }
+}
+```
+
+Save functions so they can be imported into other scripts 
+```{r}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+save(load_pkg, slope_fit, plot_scatter, plot_corr, save_all_ggplots, file = 'functions.rda')
+```
